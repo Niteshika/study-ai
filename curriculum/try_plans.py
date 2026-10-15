@@ -19,15 +19,14 @@ TOPICS = [
 
 if __name__ == "__main__":
     conn = store.db("data/try_plans.db")
-    for i, (topic, level, goal, time) in enumerate(TOPICS):
-        user = f"tester{i}"
+    for topic, level, goal, time in TOPICS:  # one test user, many plans
         print(f"\n=== {topic} ({level}, {goal}, {time}) ===")
         try:
-            generate_plan(user, topic, level, goal, time, conn=conn)
+            result = generate_plan("tester", topic, level, goal, time, conn=conn)
         except PlanError as e:
             print("FAILED:", e)
             continue
-        plan = store.get_plan(conn, user)
+        plan = store.get_plan(conn, result["plan_id"])
         names = {c["id"]: c["name"] for c in plan}
         for c in plan:
             needs = ", ".join(names[p] for p in c["prerequisites"]) or "-"

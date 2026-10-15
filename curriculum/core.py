@@ -28,26 +28,49 @@ FAKE_PLAN = {
 }
 
 
-def new_id() -> str:
+def new_id(prefix="c_") -> str:
     # Text ids, same style as Person 1's ("file_ab12...").
-    return "c_" + uuid.uuid4().hex[:12]
+    return prefix + uuid.uuid4().hex[:12]
 
 
 # ---------------------------------------------------------------- Phase 1
 
-def generate_plan(user_id, topic, level, goal, time, conn=None) -> list[str]:
-    """Build and save an ordered concept plan. Returns concept ids in learning order.
+def generate_plan(user_id, topic, level, goal, time, conn=None) -> dict:
+    """Build and save a NEW ordered concept plan. The user's other plans are kept.
 
-    A new plan REPLACES the user's old one (open team question: one plan or many?).
-    After a new plan, Person 1's match_file_to_concepts should be re-run on the
-    user's files, because the old concept ids are gone.
+    Returns {"plan_id": "p_...", "concept_ids": [...in learning order...]}.
+    After a new plan, Person 1's match_file_to_concepts can be re-run on the
+    user's files so their notes link to the new concepts too.
     """
     conn = conn or store.db()
     if os.getenv("CURRICULUM_FAKE") == "1":
         concepts = check_plan(FAKE_PLAN)
     else:
         concepts = _ask_llm_for_plan(topic, level, goal, time)
-    return _save_plan(conn, user_id, concepts)
+    return _save_plan(conn, user_id, topic, level, goal, time, concepts)
+
+
+def list_plans(user_id, conn=None) -> list[dict]:
+    """All of a user's plans, newest first.
+    Returns [{id, user_id, topic, level, goal, time, created_at, num_concepts}]."""
+    return store.list_plans(conn or store.db(), user_id)
+
+
+def delete_plan(user_id, plan_id, conn=None) -> dict:
+    """Delete one plan and its concepts. The user's other plans are untouched.
+    Also removes Person 1's note links (concept_chunks) to those concepts."""
+    conn = conn or store.db()
+    owner = conn.execute("SELECT user_id FROM plans WHERE id=?", (plan_id,)).fetchone()
+    if owner is None or owner["user_id"] != user_id:
+        return {"ok": False, "error": "No such plan for this user"}
+    with conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM concepts WHERE plan_id=?", (plan_id,))]
+        if ids and store.table_exists(conn, "concept_chunks"):
+            marks = ",".join("?" * len(ids))
+            conn.execute(f"DELETE FROM concept_chunks WHERE concept_id IN ({marks})", ids)
+        conn.execute("DELETE FROM concepts WHERE plan_id=?", (plan_id,))
+        conn.execute("DELETE FROM plans WHERE id=?", (plan_id,))
+    return {"ok": True}
 
 
 def _ask_llm_for_plan(topic, level, goal, time) -> list[dict]:
@@ -65,25 +88,24 @@ def _ask_llm_for_plan(topic, level, goal, time) -> list[dict]:
     raise PlanError([f"Gave up after {MAX_TRIES} tries."] + problems)
 
 
-def _save_plan(conn, user_id, concepts: list[dict]) -> list[str]:
-    """Write checked concepts with source='ai'. All saved, or nothing saved."""
+def _save_plan(conn, user_id, topic, level, goal, time, concepts: list[dict]) -> dict:
+    """Write a new plan row and its checked concepts (source='ai').
+    All saved, or nothing saved."""
+    plan_id = new_id("p_")
     ids = {c["name"].lower(): new_id() for c in concepts}
     with conn:
-        old = [r["id"] for r in conn.execute("SELECT id FROM concepts WHERE user_id=?", (user_id,))]
-        if old and store.table_exists(conn, "concept_chunks"):
-            # Person 1's links from notes to the old concepts would point at nothing.
-            marks = ",".join("?" * len(old))
-            conn.execute(f"DELETE FROM concept_chunks WHERE concept_id IN ({marks})", old)
-        conn.execute("DELETE FROM concepts WHERE user_id=?", (user_id,))
-
+        conn.execute(
+            "INSERT INTO plans (id, user_id, topic, level, goal, time) VALUES (?, ?, ?, ?, ?, ?)",
+            (plan_id, user_id, topic, level, goal, time),
+        )
         conn.executemany(
-            "INSERT INTO concepts (id, user_id, name, definition, prerequisites, position, source, verified)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'ai', 0)",
-            [(ids[c["name"].lower()], user_id, c["name"], c["definition"],
+            "INSERT INTO concepts (id, user_id, plan_id, name, definition, prerequisites, position, source, verified)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 'ai', 0)",
+            [(ids[c["name"].lower()], user_id, plan_id, c["name"], c["definition"],
               json.dumps([ids[p.lower()] for p in c["prerequisites"]]), pos)
              for pos, c in enumerate(concepts)],
         )
-    return [ids[c["name"].lower()] for c in concepts]
+    return {"plan_id": plan_id, "concept_ids": [ids[c["name"].lower()] for c in concepts]}
 
 
 # ---------------------------------------------------------------- Phase 2
@@ -114,23 +136,23 @@ def generate_quiz(concept_id, n=3, target_misconception=None) -> list[dict]:
     return qs[:n]
 
 
-def generate_diagnostic(user_id) -> list[dict]:
-    """STUB (Phase 5). 1-2 questions per early concept."""
+def generate_diagnostic(user_id, plan_id) -> list[dict]:
+    """STUB (Phase 5). 1-2 questions per early concept of this plan."""
     return generate_quiz("c_stub", n=2)
 
 
-def edit_plan(user_id, action, concept) -> dict:
-    """STUB (Phase 5). action: 'add' | 'remove' | 'reorder'."""
+def edit_plan(user_id, plan_id, action, concept) -> dict:
+    """STUB (Phase 5). action: 'add' | 'remove' | 'reorder', inside one plan."""
     if action not in ("add", "remove", "reorder"):
         return {"ok": False, "error": f"Unknown action {action!r}"}
     return {"ok": True}
 
 
-def next_new_concept(user_id, conn=None) -> str | None:
-    """STUB (Phase 7). First concept in the plan for now; later, the first one
+def next_new_concept(user_id, plan_id, conn=None) -> str | None:
+    """STUB (Phase 7). First concept of this plan for now; later, the first one
     whose prerequisites are all mastered (needs Person 3's mastery data)."""
     conn = conn or store.db()
-    plan = store.get_plan(conn, user_id)
+    plan = store.get_plan(conn, plan_id)
     return plan[0]["id"] if plan else None
 
 

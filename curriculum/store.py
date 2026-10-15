@@ -12,8 +12,9 @@ from pathlib import Path
 
 _SCHEMA = Path(__file__).with_name("schema.sql")
 
-# Columns the plan needs that an older `concepts` table might be missing.
+# Columns the plans need that an older `concepts` table might be missing.
 _EXTRA_COLUMNS = {
+    "plan_id": "TEXT",
     "prerequisites": "TEXT NOT NULL DEFAULT '[]'",
     "position": "INTEGER NOT NULL DEFAULT 0",
 }
@@ -36,6 +37,8 @@ def db(path=None) -> sqlite3.Connection:
     for col, spec in _EXTRA_COLUMNS.items():
         if col not in have:
             conn.execute(f"ALTER TABLE concepts ADD COLUMN {col} {spec}")
+    # Made here, not in schema.sql: the column may only exist after the ALTER above.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_concepts_plan ON concepts(plan_id)")
     conn.commit()
     return conn
 
@@ -59,8 +62,20 @@ def get_concept(conn, concept_id) -> dict | None:
     return to_dict(row) if row else None
 
 
-def get_plan(conn, user_id) -> list[dict]:
+def get_plan(conn, plan_id) -> list[dict]:
+    """The concepts of one plan, in learning order."""
     rows = conn.execute(
-        "SELECT * FROM concepts WHERE user_id=? ORDER BY position", (user_id,)
+        "SELECT * FROM concepts WHERE plan_id=? ORDER BY position", (plan_id,)
     ).fetchall()
     return [to_dict(r) for r in rows]
+
+
+def list_plans(conn, user_id) -> list[dict]:
+    """All of a user's plans, newest first, with how many concepts each has."""
+    rows = conn.execute(
+        "SELECT p.*, COUNT(c.id) AS num_concepts FROM plans p "
+        "LEFT JOIN concepts c ON c.plan_id = p.id "
+        "WHERE p.user_id=? GROUP BY p.id ORDER BY p.created_at DESC, p.rowid DESC",
+        (user_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]

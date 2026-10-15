@@ -123,22 +123,25 @@ def test_parse_strips_code_fences_and_rejects_junk():
 
 def test_generate_plan_saves_in_order_with_prereq_ids(conn, monkeypatch):
     monkeypatch.setattr(core.llm, "chat", FakeLLM(json.dumps(GOOD)))
-    ids = core.generate_plan("u1", "Graphs", "beginner", "interviews", "1 week", conn=conn)
+    result = core.generate_plan("u1", "Graphs", "beginner", "interviews", "1 week", conn=conn)
+    ids = result["concept_ids"]
 
-    plan = store.get_plan(conn, "u1")
+    assert result["plan_id"].startswith("p_")
+    plan = store.get_plan(conn, result["plan_id"])
     assert [c["id"] for c in plan] == ids
     assert all(i.startswith("c_") for i in ids)
     assert [c["name"] for c in plan] == ["A", "B", "C", "D", "E"]
     by_name = {c["name"]: c for c in plan}
     assert by_name["E"]["prerequisites"] == [by_name["C"]["id"], by_name["D"]["id"]]
     assert all(c["source"] == "ai" and c["verified"] is False for c in plan)
+    assert all(c["plan_id"] == result["plan_id"] for c in plan)
 
 
 def test_bad_output_is_sent_back_and_fixed(conn, monkeypatch):
     bad = make_plan(("A", []), ("B", ["Z"]), ("C", []), ("D", []), ("E", []))
     fake = FakeLLM("not json", json.dumps(bad), json.dumps(GOOD))
     monkeypatch.setattr(core.llm, "chat", fake)
-    assert len(core.generate_plan("u1", "X", "b", "g", "t", conn=conn)) == 5
+    assert len(core.generate_plan("u1", "X", "b", "g", "t", conn=conn)["concept_ids"]) == 5
     assert "'Z', which is not in the plan" in fake.prompts[2]  # problem was sent back
 
 
@@ -146,64 +149,99 @@ def test_gives_up_and_saves_nothing(conn, monkeypatch):
     monkeypatch.setattr(core.llm, "chat", FakeLLM("junk", "junk", "junk"))
     with pytest.raises(PlanError, match="Gave up"):
         core.generate_plan("u1", "X", "b", "g", "t", conn=conn)
-    assert store.get_plan(conn, "u1") == []
-
-
-def test_new_plan_replaces_old_and_users_are_separate(conn, monkeypatch):
-    monkeypatch.setattr(core.llm, "chat", FakeLLM(*[json.dumps(GOOD)] * 3))
-    core.generate_plan("u1", "X", "b", "g", "t", conn=conn)
-    core.generate_plan("u1", "Y", "b", "g", "t", conn=conn)
-    core.generate_plan("u2", "X", "b", "g", "t", conn=conn)
-    assert len(store.get_plan(conn, "u1")) == 5
-    assert len(store.get_plan(conn, "u2")) == 5
+    assert core.list_plans("u1", conn=conn) == []
+    assert conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
 
 
 def test_fake_mode_needs_no_llm(conn, monkeypatch):
     monkeypatch.setenv("CURRICULUM_FAKE", "1")
     monkeypatch.setattr(core.llm, "chat", lambda *a, **k: pytest.fail("LLM called"))
-    assert len(core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)) == 5
+    assert len(core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)["concept_ids"]) == 5
 
 
 def test_get_definition_and_next_concept(conn, monkeypatch):
     monkeypatch.setenv("CURRICULUM_FAKE", "1")
-    ids = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
-    d = core.get_definition(ids[0], conn=conn)
+    result = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
+    first = result["concept_ids"][0]
+    d = core.get_definition(first, conn=conn)
     assert d["source"] == "ai" and d["verified"] is False and d["definition"]
-    assert core.next_new_concept("u1", conn=conn) == ids[0]
+    assert core.next_new_concept("u1", result["plan_id"], conn=conn) == first
+
+
+# ---------------- several plans per user
+
+def test_user_keeps_several_plans(conn, monkeypatch):
+    monkeypatch.setattr(core.llm, "chat", FakeLLM(*[json.dumps(GOOD)] * 3))
+    dsa = core.generate_plan("u1", "DSA", "b", "g", "t", conn=conn)
+    sql = core.generate_plan("u1", "SQL", "b", "g", "t", conn=conn)
+    other = core.generate_plan("u2", "DSA", "b", "g", "t", conn=conn)
+
+    plans = core.list_plans("u1", conn=conn)
+    assert {p["topic"] for p in plans} == {"DSA", "SQL"}
+    assert all(p["num_concepts"] == 5 for p in plans)
+    # Each plan has its own concepts, and the first plan was not replaced.
+    assert [c["id"] for c in store.get_plan(conn, dsa["plan_id"])] == dsa["concept_ids"]
+    assert [c["id"] for c in store.get_plan(conn, sql["plan_id"])] == sql["concept_ids"]
+    assert set(dsa["concept_ids"]).isdisjoint(sql["concept_ids"])
+    assert [p["topic"] for p in core.list_plans("u2", conn=conn)] == ["DSA"]
+    assert other["plan_id"] not in {p["id"] for p in plans}
+
+
+def test_prereqs_stay_inside_their_plan(conn, monkeypatch):
+    monkeypatch.setattr(core.llm, "chat", FakeLLM(*[json.dumps(GOOD)] * 2))
+    a = core.generate_plan("u1", "DSA", "b", "g", "t", conn=conn)
+    core.generate_plan("u1", "SQL", "b", "g", "t", conn=conn)
+    for c in store.get_plan(conn, a["plan_id"]):
+        assert set(c["prerequisites"]) <= set(a["concept_ids"])
+
+
+def test_delete_plan_only_removes_that_plan(conn, monkeypatch):
+    monkeypatch.setenv("CURRICULUM_FAKE", "1")
+    dsa = core.generate_plan("u1", "DSA", "b", "g", "t", conn=conn)
+    sql = core.generate_plan("u1", "SQL", "b", "g", "t", conn=conn)
+
+    assert core.delete_plan("u2", dsa["plan_id"], conn=conn)["ok"] is False  # not u2's plan
+    assert core.delete_plan("u1", dsa["plan_id"], conn=conn) == {"ok": True}
+    assert [p["topic"] for p in core.list_plans("u1", conn=conn)] == ["SQL"]
+    assert store.get_plan(conn, dsa["plan_id"]) == []
+    assert len(store.get_plan(conn, sql["plan_id"])) == 5
 
 
 # ---------------- fits with Person 1 (retrieval)
 
-def test_works_on_person1s_concepts_table(tmp_path, monkeypatch):
-    """If retrieval created `concepts` first (no prerequisites/position), we add them."""
-    from retrieval import store as rstore
-    monkeypatch.setattr(rstore, "DB_PATH", tmp_path / "shared.db")
-    rstore.db().close()  # Person 1's fallback CREATE runs first
-
-    monkeypatch.setenv("CURRICULUM_FAKE", "1")
-    conn = store.db(tmp_path / "shared.db")
-    ids = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
-    assert len(store.get_plan(conn, "u1")) == len(ids) == 5
-
-
-def test_new_plan_removes_note_links_to_old_concepts(tmp_path, monkeypatch):
+def _person1_table_first(tmp_path, monkeypatch):
+    """Let retrieval create `concepts` first, with only Person 1's columns."""
     from retrieval import store as rstore
     monkeypatch.setattr(rstore, "DB_PATH", tmp_path / "shared.db")
     rstore.db().close()
-
     monkeypatch.setenv("CURRICULUM_FAKE", "1")
-    conn = store.db(tmp_path / "shared.db")
-    old = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
-    conn.execute("INSERT INTO concept_chunks (concept_id, chunk_id, score) VALUES (?, 'ch1', 0.9)", (old[0],))
+    return store.db(tmp_path / "shared.db")
+
+
+def test_works_on_person1s_concepts_table(tmp_path, monkeypatch):
+    conn = _person1_table_first(tmp_path, monkeypatch)
+    result = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
+    assert len(store.get_plan(conn, result["plan_id"])) == 5
+
+
+def test_new_plan_keeps_note_links_but_delete_removes_them(tmp_path, monkeypatch):
+    conn = _person1_table_first(tmp_path, monkeypatch)
+    first = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
+    conn.execute("INSERT INTO concept_chunks (concept_id, chunk_id, score) VALUES (?, 'ch1', 0.9)",
+                 (first["concept_ids"][0],))
     conn.commit()
-    core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
-    assert conn.execute("SELECT COUNT(*) FROM concept_chunks").fetchone()[0] == 0
+    count = lambda: conn.execute("SELECT COUNT(*) FROM concept_chunks").fetchone()[0]  # noqa: E731
+
+    core.generate_plan("u1", "SQL", "b", "g", "t", conn=conn)
+    assert count() == 1  # a second plan doesn't touch the first plan's note links
+    core.delete_plan("u1", first["plan_id"], conn=conn)
+    assert count() == 0  # deleting the plan does
 
 
 def test_person1_can_embed_our_definitions(tmp_path, monkeypatch):
     """Person 1 embeds 'name: definition'. Every definition is one short sentence."""
     monkeypatch.setenv("CURRICULUM_FAKE", "1")
     conn = store.db(tmp_path / "x.db")
-    core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
-    for c in store.get_plan(conn, "u1"):
+    result = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
+    for c in store.get_plan(conn, result["plan_id"]):
         assert c["definition"].count(". ") == 0 and len(c["definition"].split()) <= 35
