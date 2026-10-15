@@ -1,0 +1,12 @@
+# Secrets: never push these
+.env
+
+# Local data (uploaded files, SQLite db, ChromaDB vectors)
+data/
+
+# Python junk
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
