@@ -147,7 +147,7 @@ def test_get_definition_and_next_concept(conn, monkeypatch):
     monkeypatch.setenv("CURRICULUM_FAKE", "1")
     result = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
     first = result["concept_ids"][0]
-    d = core.get_definition(first, conn=conn)
+    d = core.get_definition("u1",first, conn=conn)
     assert d["source"] == "ai" and d["verified"] is False and d["definition"]
     assert core.next_new_concept("u1", result["plan_id"], conn=conn) == first
 
