@@ -1,7 +1,4 @@
-"""The one LLM wrapper (team rule 3). Person 4 owns this file.
-
-This is a minimal version so retrieval can run now. Merge `embed()` into
-Person 4's llm.py when theirs lands; keep the same signature.
+"""The one LLM wrapper. Only OpenAI or Gemini.
 
 Provider is picked with LLM_PROVIDER in .env:
   openai  -> text-embedding-3-small (1536 dims)
@@ -18,7 +15,25 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
+
+def _load_keys_from_secrets_manager():
+    """On EC2: if APP_SECRET_ID is set (e.g. study-ai/app), copy OPENAI_API_KEY and
+    GEMINI_API_KEY from that secret into the environment, so no key sits in a file.
+    Keys already set in the environment win."""
+    secret_id = os.getenv("APP_SECRET_ID")
+    if not secret_id:
+        return
+    import json
+    import boto3
+    sm = boto3.client("secretsmanager", region_name=os.getenv("AWS_REGION", "ap-south-1"))
+    for k, v in json.loads(sm.get_secret_value(SecretId=secret_id)["SecretString"]).items():
+        if v and not os.getenv(k):
+            os.environ[k] = v
+
+
+_load_keys_from_secrets_manager()
+
+PROVIDER =os.getenv("LLM_PROVIDER", "openai").lower()
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")

@@ -1,7 +1,7 @@
 """Prompts and setup questions for the curriculum builder."""
 
 # Phase 1: questions the app asks before building a plan.
-# Person 4 shows these in the UI and passes the answers to generate_plan.
+# The website shows these and passes the answers to generate_plan.
 SETUP_QUESTIONS = [
     {
         "key": "level",

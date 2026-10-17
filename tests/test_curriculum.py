@@ -1,26 +1,15 @@
-"""Tests for Person 2 (Curriculum). Offline: fake LLM replies, temp database.
+"""Tests for curriculum. Offline: fake LLM replies. Needs the test Postgres (see conftest.py).
 
     pytest tests/test_curriculum.py -q
 """
 
 import json
-import os
-import sys
-import tempfile
-from pathlib import Path
 
-TMP = Path(tempfile.mkdtemp())
-os.environ["DATA_DIR"] = str(TMP / "data")
-os.environ.pop("CURRICULUM_FAKE", None)
-# llm.py reads LLM_PROVIDER once, on import. Set it before anything imports llm,
-# or Person 1's tests (run in the same session) would try the real OpenAI API.
-os.environ["LLM_PROVIDER"] = "fake"
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import pytest
 
-import pytest  # noqa: E402
-
-from curriculum import core, store  # noqa: E402
-from curriculum.validate import PlanError, check_plan, parse_json  # noqa: E402
+from core.curriculum import service as core
+from core.curriculum import store
+from core.curriculum.validate import PlanError, check_plan, parse_json
 
 
 def make_plan(*items):
@@ -31,11 +20,6 @@ def make_plan(*items):
 
 GOOD = make_plan(("A", []), ("B", ["A"]), ("C", ["B"]), ("D", ["A"]), ("E", ["C", "D"]))
 FIVE = lambda: make_plan(("A", []), ("B", []), ("C", []), ("D", []), ("E", []))  # noqa: E731
-
-
-@pytest.fixture
-def conn():
-    return store.db(":memory:")
 
 
 class FakeLLM:
@@ -150,7 +134,7 @@ def test_gives_up_and_saves_nothing(conn, monkeypatch):
     with pytest.raises(PlanError, match="Gave up"):
         core.generate_plan("u1", "X", "b", "g", "t", conn=conn)
     assert core.list_plans("u1", conn=conn) == []
-    assert conn.execute("SELECT COUNT(*) FROM concepts").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) AS n FROM concepts").fetchone()["n"] == 0
 
 
 def test_fake_mode_needs_no_llm(conn, monkeypatch):
@@ -207,41 +191,51 @@ def test_delete_plan_only_removes_that_plan(conn, monkeypatch):
     assert len(store.get_plan(conn, sql["plan_id"])) == 5
 
 
-# ---------------- fits with Person 1 (retrieval)
+# ---------------- plans written by Claude (MCP server)
 
-def _person1_table_first(tmp_path, monkeypatch):
-    """Let retrieval create `concepts` first, with only Person 1's columns."""
-    from retrieval import store as rstore
-    monkeypatch.setattr(rstore, "DB_PATH", tmp_path / "shared.db")
-    rstore.db().close()
+def test_save_plan_checks_claudes_plan(conn):
+    result = core.save_plan("u1", "Graphs", GOOD["concepts"], level="beginner", conn=conn)
+    assert len(result["concept_ids"]) == 5
+    plan = core.get_plan("u1", result["plan_id"], conn=conn)
+    assert plan["topic"] == "Graphs" and [c["name"] for c in plan["concepts"]] == list("ABCDE")
+    assert core.get_plan("u2", result["plan_id"], conn=conn) is None  # not u2's plan
+
+    bad = make_plan(("A", ["C"]), ("B", ["A"]), ("C", ["B"]), ("D", []), ("E", []))["concepts"]
+    with pytest.raises(PlanError, match="loop"):
+        core.save_plan("u1", "Bad", bad, conn=conn)
+    assert len(core.list_plans("u1", conn=conn)) == 1  # the bad plan was not saved
+
+
+# ---------------- fits with retrieval
+
+def _add_note_link(conn, user_id, concept_id):
+    """Insert one fake file + chunk and link it to a concept."""
+    from core.db import vec
+    conn.execute("INSERT INTO files (id, user_id, filename, storage_path, sha256, status)"
+                 " VALUES ('f1', %s, 'n.md', '/tmp/n.md', 'x', 'ready')", (user_id,))
+    conn.execute("INSERT INTO chunks (id, file_id, user_id, idx, text, embedding)"
+                 " VALUES ('ch1', 'f1', %s, 0, 'hi', %s)", (user_id, vec([1.0, 0.0])))
+    conn.execute("INSERT INTO concept_chunks (concept_id, chunk_id, score) VALUES (%s, 'ch1', 0.9)",
+                 (concept_id,))
+
+
+def test_new_plan_keeps_note_links_but_delete_removes_them(conn, monkeypatch):
     monkeypatch.setenv("CURRICULUM_FAKE", "1")
-    return store.db(tmp_path / "shared.db")
-
-
-def test_works_on_person1s_concepts_table(tmp_path, monkeypatch):
-    conn = _person1_table_first(tmp_path, monkeypatch)
-    result = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
-    assert len(store.get_plan(conn, result["plan_id"])) == 5
-
-
-def test_new_plan_keeps_note_links_but_delete_removes_them(tmp_path, monkeypatch):
-    conn = _person1_table_first(tmp_path, monkeypatch)
     first = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
-    conn.execute("INSERT INTO concept_chunks (concept_id, chunk_id, score) VALUES (?, 'ch1', 0.9)",
-                 (first["concept_ids"][0],))
-    conn.commit()
-    count = lambda: conn.execute("SELECT COUNT(*) FROM concept_chunks").fetchone()[0]  # noqa: E731
+    _add_note_link(conn, "u1", first["concept_ids"][0])
+    count = lambda: conn.execute("SELECT COUNT(*) AS n FROM concept_chunks").fetchone()["n"]  # noqa: E731
 
     core.generate_plan("u1", "SQL", "b", "g", "t", conn=conn)
     assert count() == 1  # a second plan doesn't touch the first plan's note links
     core.delete_plan("u1", first["plan_id"], conn=conn)
     assert count() == 0  # deleting the plan does
+    # ...but the user's notes themselves are kept
+    assert conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"] == 1
 
 
-def test_person1_can_embed_our_definitions(tmp_path, monkeypatch):
-    """Person 1 embeds 'name: definition'. Every definition is one short sentence."""
+def test_retrieval_can_embed_our_definitions(conn, monkeypatch):
+    """Retrieval embeds 'name: definition'. Every definition is one short sentence."""
     monkeypatch.setenv("CURRICULUM_FAKE", "1")
-    conn = store.db(tmp_path / "x.db")
     result = core.generate_plan("u1", "Python", "b", "g", "t", conn=conn)
     for c in store.get_plan(conn, result["plan_id"]):
         assert c["definition"].count(". ") == 0 and len(c["definition"].split()) <= 35

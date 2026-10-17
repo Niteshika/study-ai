@@ -1,24 +1,15 @@
-"""End-to-end tests for Person 1. Runs offline: fake embedder, temp data folder.
+"""End-to-end tests for retrieval. Offline: fake embedder. Needs the test Postgres (see conftest.py).
 
     pytest tests/test_retrieval.py -q
 """
 
-import os
-import sys
-import tempfile
-from pathlib import Path
+import pymupdf
+import pytest
 
-TMP = Path(tempfile.mkdtemp())
-os.environ["DATA_DIR"] = str(TMP / "data")
-os.environ["LLM_PROVIDER"] = "fake"
-os.environ.pop("RETRIEVAL_STUB", None)
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import pymupdf  # noqa: E402
-import pytest  # noqa: E402
-
-from retrieval import core, store, stubs  # noqa: E402
-from retrieval.chunker import chunk_blocks, count_tokens  # noqa: E402
+from conftest import TMP, wipe
+from core import db
+from core.retrieval import service as core, stubs
+from core.retrieval.chunker import chunk_blocks, count_tokens
 
 USER = "u1"
 GD = ("Gradient descent is an optimization method. It updates each weight by taking a small step "
@@ -38,6 +29,11 @@ def make_pdf(path):
     doc.save(path)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _clean_db():
+    wipe()  # these tests build on each other, so wipe once for the whole file
+
+
 @pytest.fixture(scope="module")
 def files():
     pdf = TMP / "ml_notes.pdf"
@@ -55,17 +51,19 @@ def files():
 
 @pytest.fixture(scope="module")
 def concepts():
-    conn = store.db()
-    conn.executemany("INSERT OR REPLACE INTO concepts (id, user_id, name, definition) VALUES (?,?,?,?)", [
-        ("c_gd", USER, "Gradient descent", "Optimization that steps weights against the gradient of the loss."),
-        ("c_overfit", USER, "Overfitting", "Model memorizes training data noise and performs badly on new data."),
-        ("c_attention", USER, "Attention", "Transformers weigh tokens with query key value attention scores."),
-    ])
-    conn.commit(); conn.close()
+    with db.connect() as conn:
+        conn.execute("INSERT INTO plans (id, user_id, topic) VALUES ('p_ml', %s, 'ML')", (USER,))
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO concepts (id, user_id, plan_id, name, definition) VALUES (%s,%s,'p_ml',%s,%s)", [
+                    ("c_gd", USER, "Gradient descent", "Optimization that steps weights against the gradient of the loss."),
+                    ("c_overfit", USER, "Overfitting", "Model memorizes training data noise and performs badly on new data."),
+                    ("c_attention", USER, "Attention", "Transformers weigh tokens with query key value attention scores."),
+                ])
 
 
 def test_chunk_sizes_and_pages(files):
-    from retrieval.extract import extract_blocks
+    from core.retrieval.extract import extract_blocks
     chunks = chunk_blocks(extract_blocks(str(files["pdf"])))
     assert len(chunks) >= 2
     assert all(c["n_tokens"] <= 520 for c in chunks)
@@ -81,18 +79,18 @@ def test_long_paragraph_is_split():
 
 def test_ingest_and_dedupe(files):
     fid = core.ingest_file(USER, files["pdf"])
-    conn = store.db()
-    row = conn.execute("SELECT * FROM files WHERE id=?", (fid,)).fetchone()
+    with db.connect() as conn:
+        row = conn.execute("SELECT * FROM files WHERE id = %s", (fid,)).fetchone()
     assert row["status"] == "ready" and row["num_pages"] == 2 and row["num_chunks"] >= 2
     assert core.ingest_file(USER, files["pdf"]) == fid  # same file twice -> same id
     core.ingest_file(USER, files["md"])
 
 
 def test_empty_and_scanned(files):
-    conn = store.db()
-    for key in ("empty", "scan"):
-        fid = core.ingest_file(USER, files[key])
-        assert conn.execute("SELECT status FROM files WHERE id=?", (fid,)).fetchone()[0] == "empty"
+    with db.connect() as conn:
+        for key in ("empty", "scan"):
+            fid = core.ingest_file(USER, files[key])
+            assert conn.execute("SELECT status FROM files WHERE id = %s", (fid,)).fetchone()["status"] == "empty"
 
 
 def test_unsupported(tmp_path):
@@ -124,8 +122,8 @@ def test_match_and_coverage(files, concepts):
     assert cov["c_gd"]["files"][0]["filename"] == "ml_notes.pdf"
     assert cov["c_attention"]["files"] == []
 
-    conn = store.db()
-    assert conn.execute("SELECT source FROM concepts WHERE id='c_gd'").fetchone()[0] == "both"
+    with db.connect() as conn:
+        assert conn.execute("SELECT source FROM concepts WHERE id='c_gd'").fetchone()["source"] == "both"
     hit = core.search(USER, "overfitting memorizes noise", k=1)[0]
     assert hit["concept_id"] == "c_overfit"
 

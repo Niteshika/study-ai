@@ -1,0 +1,17 @@
+# How the app runs on EC2:   docker compose up -d --build
+#
+# network_mode: host lets the container use the server's IAM role
+# (for Secrets Manager and S3), so no AWS keys are needed anywhere.
+# The app listens on port 8000, which the security group keeps closed to the
+# internet. HTTPS (Caddy, next step) will sit in front of it on 443.
+services:
+  app:
+    build: .
+    env_file: .env
+    network_mode: host
+    restart: unless-stopped      # starts again after a crash or a server reboot
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"          # don't let logs fill the disk
+        max-file: "3"

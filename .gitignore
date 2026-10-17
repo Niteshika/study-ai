@@ -1,7 +1,7 @@
 # Secrets: never push these
 .env
 
-# Local data (uploaded files, SQLite db, ChromaDB vectors)
+# Local data (uploaded files in dev)
 data/
 
 # Python junk

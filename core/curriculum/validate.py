@@ -9,7 +9,7 @@ import json
 
 MIN_CONCEPTS = 5
 MAX_CONCEPTS = 10
-MAX_DEFINITION_WORDS = 35  # Person 1 embeds "name: definition" to match notes
+MAX_DEFINITION_WORDS = 35  # retrieval embeds "name: definition" to match notes
 
 
 def sentence_count(text: str) -> int:

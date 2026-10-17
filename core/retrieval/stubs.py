@@ -1,6 +1,6 @@
-"""Fake versions of Person 1's functions (Phase 0).
+"""Fake versions of the retrieval functions.
 
-Same signatures and return shapes as the real ones, so Person 2/3/4 can build
+Same signatures and return shapes as the real ones, so other parts can build
 against them before ingestion works. Turn on with RETRIEVAL_STUB=1.
 """
 

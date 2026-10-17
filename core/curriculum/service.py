@@ -1,16 +1,22 @@
-"""Person 2: Curriculum Builder. Turns "I want to learn X" into an ordered concept plan.
+"""Curriculum: turns "I want to learn X" into an ordered concept plan.
 
 Status:
-  generate_plan  - REAL (Phase 1). CURRICULUM_FAKE=1 gives the Phase 0 fake plan.
-  get_definition - REAL for saved definitions (Phase 2/4 add more).
-  the rest       - STUBS with the right return shapes, so others can build now.
+  generate_plan  - REAL. Our own LLM call (OpenAI/Gemini). Used by the website.
+  save_plan      - REAL. Saves a plan someone else wrote (Claude, via the MCP
+                   server) after the same checks. Used by the MCP server.
+  list_plans, delete_plan, get_definition - REAL.
+  the rest       - STUBS with the right return shapes.
+
+Every function takes an optional `conn`. Without one, it opens and closes its own.
+CURRICULUM_FAKE=1 gives a fixed fake plan (no API key needed).
 """
 
-import json
 import os
 import uuid
+from contextlib import contextmanager
 
-import llm
+from core import db, llm
+from core.db import Jsonb
 from . import store
 from .prompts import FIX_PROMPT, PLAN_PROMPT, PLAN_SYSTEM
 from .validate import MAX_CONCEPTS, MIN_CONCEPTS, PlanError, check_plan, parse_json
@@ -29,8 +35,18 @@ FAKE_PLAN = {
 
 
 def new_id(prefix="c_") -> str:
-    # Text ids, same style as Person 1's ("file_ab12...").
+    # Text ids, same style as files ("file_ab12...").
     return prefix + uuid.uuid4().hex[:12]
+
+
+@contextmanager
+def _use(conn):
+    """Use the caller's connection, or open (and later close) our own."""
+    if conn is not None:
+        yield conn
+    else:
+        with db.connect() as own:
+            yield own
 
 
 # ---------------------------------------------------------------- Phase 1
@@ -39,37 +55,52 @@ def generate_plan(user_id, topic, level, goal, time, conn=None) -> dict:
     """Build and save a NEW ordered concept plan. The user's other plans are kept.
 
     Returns {"plan_id": "p_...", "concept_ids": [...in learning order...]}.
-    After a new plan, Person 1's match_file_to_concepts can be re-run on the
+    After a new plan, retrieval's match_file_to_concepts can be re-run on the
     user's files so their notes link to the new concepts too.
     """
-    conn = conn or store.db()
     if os.getenv("CURRICULUM_FAKE") == "1":
         concepts = check_plan(FAKE_PLAN)
     else:
         concepts = _ask_llm_for_plan(topic, level, goal, time)
-    return _save_plan(conn, user_id, topic, level, goal, time, concepts)
+    with _use(conn) as c:
+        return _save_plan(c, user_id, topic, level, goal, time, concepts)
+
+
+def save_plan(user_id, topic, concepts, level=None, goal=None, time=None, conn=None) -> dict:
+    """Save a plan that was written somewhere else (e.g. by Claude through the
+    MCP server). It goes through exactly the same checks as our own plans.
+
+    concepts = [{"name": ..., "definition": ..., "prerequisites": [names]}]
+    Raises PlanError with a list of problems, so the caller can fix and retry.
+    """
+    checked = check_plan({"concepts": concepts})
+    with _use(conn) as c:
+        return _save_plan(c, user_id, topic, level, goal, time, checked)
 
 
 def list_plans(user_id, conn=None) -> list[dict]:
     """All of a user's plans, newest first.
     Returns [{id, user_id, topic, level, goal, time, created_at, num_concepts}]."""
-    return store.list_plans(conn or store.db(), user_id)
+    with _use(conn) as c:
+        return store.list_plans(c, user_id)
+
+
+def get_plan(user_id, plan_id, conn=None) -> dict | None:
+    """One plan with its concepts in learning order, or None if it isn't this user's."""
+    with _use(conn) as c:
+        row = store.get_plan_row(c, plan_id)
+        if row is None or row["user_id"] != user_id:
+            return None
+        return {**row, "concepts": store.get_plan(c, plan_id)}
 
 
 def delete_plan(user_id, plan_id, conn=None) -> dict:
-    """Delete one plan and its concepts. The user's other plans are untouched.
-    Also removes Person 1's note links (concept_chunks) to those concepts."""
-    conn = conn or store.db()
-    owner = conn.execute("SELECT user_id FROM plans WHERE id=?", (plan_id,)).fetchone()
-    if owner is None or owner["user_id"] != user_id:
-        return {"ok": False, "error": "No such plan for this user"}
-    with conn:
-        ids = [r["id"] for r in conn.execute("SELECT id FROM concepts WHERE plan_id=?", (plan_id,))]
-        if ids and store.table_exists(conn, "concept_chunks"):
-            marks = ",".join("?" * len(ids))
-            conn.execute(f"DELETE FROM concept_chunks WHERE concept_id IN ({marks})", ids)
-        conn.execute("DELETE FROM concepts WHERE plan_id=?", (plan_id,))
-        conn.execute("DELETE FROM plans WHERE id=?", (plan_id,))
+    """Delete one plan. The database also removes its concepts and their links
+    to the user's notes (ON DELETE CASCADE). Other plans are untouched."""
+    with _use(conn) as c:
+        res = c.execute("DELETE FROM plans WHERE id = %s AND user_id = %s", (plan_id, user_id))
+        if res.rowcount == 0:
+            return {"ok": False, "error": "No such plan for this user"}
     return {"ok": True}
 
 
@@ -93,18 +124,19 @@ def _save_plan(conn, user_id, topic, level, goal, time, concepts: list[dict]) ->
     All saved, or nothing saved."""
     plan_id = new_id("p_")
     ids = {c["name"].lower(): new_id() for c in concepts}
-    with conn:
+    with conn.transaction():
         conn.execute(
-            "INSERT INTO plans (id, user_id, topic, level, goal, time) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO plans (id, user_id, topic, level, goal, time) VALUES (%s, %s, %s, %s, %s, %s)",
             (plan_id, user_id, topic, level, goal, time),
         )
-        conn.executemany(
-            "INSERT INTO concepts (id, user_id, plan_id, name, definition, prerequisites, position, source, verified)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 'ai', 0)",
-            [(ids[c["name"].lower()], user_id, plan_id, c["name"], c["definition"],
-              json.dumps([ids[p.lower()] for p in c["prerequisites"]]), pos)
-             for pos, c in enumerate(concepts)],
-        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO concepts (id, user_id, plan_id, name, definition, prerequisites, position,"
+                " source, verified) VALUES (%s, %s, %s, %s, %s, %s, %s, 'ai', false)",
+                [(ids[c["name"].lower()], user_id, plan_id, c["name"], c["definition"],
+                  Jsonb([ids[p.lower()] for p in c["prerequisites"]]), pos)
+                 for pos, c in enumerate(concepts)],
+            )
     return {"plan_id": plan_id, "concept_ids": [ids[c["name"].lower()] for c in concepts]}
 
 
@@ -112,8 +144,8 @@ def _save_plan(conn, user_id, topic, level, goal, time, concepts: list[dict]) ->
 
 def get_definition(concept_id, conn=None) -> dict:
     """The saved definition, so every explanation of a concept stays the same."""
-    conn = conn or store.db()
-    c = store.get_concept(conn, concept_id)
+    with _use(conn) as cn:
+        c = store.get_concept(cn, concept_id)
     if c is None:
         raise KeyError(f"No concept with id {concept_id}")
     return {"definition": c["definition"], "source": c["source"], "verified": c["verified"]}
@@ -150,9 +182,9 @@ def edit_plan(user_id, plan_id, action, concept) -> dict:
 
 def next_new_concept(user_id, plan_id, conn=None) -> str | None:
     """STUB (Phase 7). First concept of this plan for now; later, the first one
-    whose prerequisites are all mastered (needs Person 3's mastery data)."""
-    conn = conn or store.db()
-    plan = store.get_plan(conn, plan_id)
+    whose prerequisites are all mastered (needs the mastery data from Phase 3)."""
+    with _use(conn) as c:
+        plan = store.get_plan(c, plan_id)
     return plan[0]["id"] if plan else None
 
 
