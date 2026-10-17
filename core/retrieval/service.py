@@ -152,14 +152,17 @@ def _ensure_concept_vectors(conn, user_id):
 
 # ---------------------------------------------------------------- retrieval
 
-def get_chunks(concept_id, k=5):
+def get_chunks(user_id, concept_id, k=5):
     """Passages from the user's notes linked to this concept, best first.
     Returns [{text, filename, page, score}]. Empty list if no notes cover it."""
     with db.connect() as conn:
         rows = conn.execute(
             "SELECT ch.text, f.filename, ch.page_start AS page, cc.score FROM concept_chunks cc "
+            "JOIN concepts c ON c.id = cc.concept_id "
             "JOIN chunks ch ON ch.id = cc.chunk_id JOIN files f ON f.id = ch.file_id "
-            "WHERE cc.concept_id = %s ORDER BY cc.score DESC LIMIT %s", (concept_id, k)).fetchall()
+            "WHERE cc.concept_id = %s AND c.user_id = %s AND ch.user_id = %s "
+            "ORDER BY cc.score DESC LIMIT %s",
+            (concept_id, user_id, user_id, k)).fetchall()
     return [{**r, "score": round(r["score"], 4)} for r in rows]
 
 
