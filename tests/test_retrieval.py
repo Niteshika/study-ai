@@ -114,7 +114,7 @@ def test_match_and_coverage(files, concepts):
     assert {"c_gd", "c_overfit"} <= got and "c_attention" not in got
     assert set(res) == {"matched", "suggested", "conflicts"}
 
-    top = core.get_chunks("c_overfit", k=2)
+    top = core.get_chunks("u1","c_overfit", k=2)
     assert top and "Overfitting" in top[0]["text"] and top[0]["page"] == 2
     assert set(top[0]) == {"text", "filename", "page", "score"}
 
@@ -129,7 +129,7 @@ def test_match_and_coverage(files, concepts):
 
 
 def test_stubs_match_real_shapes():
-    assert set(stubs.get_chunks("c", 1)[0]) == {"text", "filename", "page", "score"}
+    assert set(stubs.get_chunks("u","c", 1)[0]) == {"text", "filename", "page", "score"}
     assert set(stubs.search("u", "q", 1)[0]) == {"text", "filename", "page", "concept_id", "score"}
     assert set(stubs.match_file_to_concepts("u", "f")) == {"matched", "suggested", "conflicts"}
     assert set(stubs.get_file_coverage("u")[0]) == {"concept_id", "verified", "files"}
