@@ -142,10 +142,10 @@ def _save_plan(conn, user_id, topic, level, goal, time, concepts: list[dict]) ->
 
 # ---------------------------------------------------------------- Phase 2
 
-def get_definition(concept_id, conn=None) -> dict:
+def get_definition(user_id,concept_id, conn=None) -> dict:
     """The saved definition, so every explanation of a concept stays the same."""
     with _use(conn) as cn:
-        c = store.get_concept(cn, concept_id)
+        c = store.get_concept(cn, user_id, concept_id)
     if c is None:
         raise KeyError(f"No concept with id {concept_id}")
     return {"definition": c["definition"], "source": c["source"], "verified": c["verified"]}
@@ -184,6 +184,9 @@ def next_new_concept(user_id, plan_id, conn=None) -> str | None:
     """STUB (Phase 7). First concept of this plan for now; later, the first one
     whose prerequisites are all mastered (needs the mastery data from Phase 3)."""
     with _use(conn) as c:
+        row = store.get_plan_row(c, plan_id)
+        if row is None or row["user_id"] != user_id:   # missing, or not this user's
+            return None
         plan = store.get_plan(c, plan_id)
     return plan[0]["id"] if plan else None
 
