@@ -28,7 +28,7 @@ def match_file_to_concepts(user_id, file_id):
     }
 
 
-def get_chunks(concept_id, k=5):
+def get_chunks(user_id,concept_id, k=5):
     return [dict(c, score=round(0.9 - 0.1 * i, 2)) for i, c in enumerate(_FAKE[:k])]
 
 
