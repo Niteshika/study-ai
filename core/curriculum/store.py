@@ -13,8 +13,10 @@ def to_dict(row) -> dict:
     return d
 
 
-def get_concept(conn, concept_id) -> dict | None:
-    row = conn.execute("SELECT * FROM concepts WHERE id = %s", (concept_id,)).fetchone()
+def get_concept(conn, user_id, concept_id) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM concepts WHERE id = %s AND user_id = %s",
+        (concept_id, user_id)).fetchone()
     return to_dict(row) if row else None
 
 
